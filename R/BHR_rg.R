@@ -1,5 +1,18 @@
 
-BHR_rg <- function(trait1_sumstats, trait2_sumstats, annotations, num_blocks = 100,genomewide_correction = TRUE,overdispersion, num_null_conditions = 0,output_jackknife_rg = FALSE, fixed_genes = NULL) {
+BHR_rg <- function(trait1_sumstats, 
+                   trait2_sumstats, 
+                   annotations, 
+                   num_blocks = 100,
+                   genomewide_correction = TRUE,
+                   overdispersion, 
+                   num_null_conditions = 0,
+                   use_null_conditions_rg = FALSE,
+                   output_jackknife_rg = FALSE, 
+                   fixed_genes = NULL,
+                   intercept = intercept,
+                   rg_random_se_estimator = "jackknife",
+                   log,
+                   start_time) {
   trait1_sumstats = trait1_sumstats[!is.na(trait1_sumstats$chromosome),]
   trait2_sumstats = trait2_sumstats[!is.na(trait2_sumstats$chromosome),]
 
@@ -27,9 +40,13 @@ BHR_rg <- function(trait1_sumstats, trait2_sumstats, annotations, num_blocks = 1
     sig_genes = fixed_genes
   }
 
-  heritability_trait1 <- BHR_h2(trait1_sumstats, annotations = annotations, num_blocks = num_blocks, fixed_genes = sig_genes, genomewide_correction = FALSE, output_jackknife_h2 = TRUE, overdispersion = overdispersion, num_null_conditions = 0, slope_correction = FALSE, all_models = TRUE, gwc_exclusion = NULL)
-  heritability_trait2 <- BHR_h2(trait2_sumstats, annotations = annotations, num_blocks = num_blocks, fixed_genes = sig_genes, genomewide_correction = FALSE,output_jackknife_h2 = TRUE, overdispersion = overdispersion, num_null_conditions = 0, slope_correction = FALSE, all_models = TRUE, gwc_exclusion = NULL)
-  print("Test")
+  if (use_null_conditions_rg) {
+    heritability_trait1 <- BHR_h2(trait1_sumstats, annotations = annotations, num_blocks = num_blocks, fixed_genes = sig_genes, genomewide_correction = FALSE, output_jackknife_h2 = TRUE, overdispersion = overdispersion, num_null_conditions = num_null_conditions, slope_correction = FALSE, all_models = TRUE, gwc_exclusion = NULL, intercept = intercept, start_time = Sys.time(), log = log)
+    heritability_trait2 <- BHR_h2(trait2_sumstats, annotations = annotations, num_blocks = num_blocks, fixed_genes = sig_genes, genomewide_correction = FALSE,output_jackknife_h2 = TRUE, overdispersion = overdispersion, num_null_conditions = num_null_conditions, slope_correction = FALSE, all_models = TRUE, gwc_exclusion = NULL, intercept = intercept, start_time = Sys.time(), log = log)
+  } else { 
+    heritability_trait1 <- BHR_h2(trait1_sumstats, annotations = annotations, num_blocks = num_blocks, fixed_genes = sig_genes, genomewide_correction = FALSE, output_jackknife_h2 = TRUE, overdispersion = overdispersion, num_null_conditions = 0, slope_correction = FALSE, all_models = TRUE, gwc_exclusion = NULL, intercept = intercept, start_time = Sys.time(), log = log)
+    heritability_trait2 <- BHR_h2(trait2_sumstats, annotations = annotations, num_blocks = num_blocks, fixed_genes = sig_genes, genomewide_correction = FALSE,output_jackknife_h2 = TRUE, overdispersion = overdispersion, num_null_conditions = 0, slope_correction = FALSE, all_models = TRUE, gwc_exclusion = NULL, intercept = intercept, start_time = Sys.time(), log = log)
+    }
   #add null moment conditions
   trait1_sumstats = trait1_sumstats[,c("gene","N","gamma_sq","gamma","w_t_beta","burden_score","burden_score_sqrt","overdispersion","chromosome","gene_position")]
   trait1_sumstats$true = TRUE
@@ -55,7 +72,7 @@ BHR_rg <- function(trait1_sumstats, trait2_sumstats, annotations, num_blocks = 1
   pair_sumstats <- merge(pair_sumstats, merged_annotations, by.x = "gene", by.y = "gene")
   pair_sumstats = pair_sumstats[with(pair_sumstats, order(chromosome, gene_position)),]
   block = ceiling((1:nrow(pair_sumstats[!(pair_sumstats$gene %in% sig_genes),]))/(nrow(pair_sumstats[!(pair_sumstats$gene %in% sig_genes),])/num_blocks))
-  genetic_covariance_random <- randomeffects_jackknife(pair_sumstats[!(pair_sumstats$gene %in% sig_genes),],merged_annotations,num_blocks,block,genomewide_correction = genomewide_correction, output_jackknife_h2 = TRUE, overdispersion = overdispersion,slope_correction = FALSE, bivariate = TRUE)
+  genetic_covariance_random <- randomeffects_jackknife(pair_sumstats[!(pair_sumstats$gene %in% sig_genes),],merged_annotations,num_blocks,block,genomewide_correction = genomewide_correction, output_jackknife_h2 = TRUE, overdispersion = overdispersion,slope_correction = FALSE, bivariate = TRUE, intercept = intercept)
 
   pair_sumstats_true = pair_sumstats[pair_sumstats$true,]
   trait1_sumstats_true = trait1_sumstats[trait1_sumstats$true,]
@@ -77,8 +94,24 @@ BHR_rg <- function(trait1_sumstats, trait2_sumstats, annotations, num_blocks = 1
   rho_jackknife = genetic_covariance_random$jackknife_h2[nrow(genetic_covariance_random$jackknife_h2),]
   h2_trait1_jackknife = heritability_trait1$subthreshold_genes$jackknife_h2[nrow(heritability_trait1$subthreshold_genes$jackknife_h2),]
   h2_trait2_jackknife = heritability_trait2$subthreshold_genes$jackknife_h2[nrow(heritability_trait2$subthreshold_genes$jackknife_h2),]
-  rg_jackknife = rho_jackknife/sqrt(h2_trait1_jackknife * h2_trait2_jackknife)
-  rg_random_se = sqrt(((num_blocks-1)/num_blocks) * sum((rg_jackknife - mean(rg_jackknife))^2))
+  
+  if (rg_random_se_estimator == "delta") {
+  gradient_rg_subthreshold = c(1/sqrt(h2_trait1_random*h2_trait2_random),
+                  (-rho_random*h2_trait2_random)/(2 * (h2_trait1_random*h2_trait2_random)^(-3/2)),
+                  (-rho_random*h2_trait1_random)/(2 * (h2_trait1_random*h2_trait2_random)^(-3/2)))
+  
+  jackknife_rg_subthreshold_mat = cbind(rho_jackknife - mean(rho_jackknife), h2_trait1_jackknife - mean(h2_trait1_jackknife),h2_trait2_jackknife - mean(h2_trait2_jackknife))
+  S_rg_subthreshold = ((num_blocks-1)/num_blocks)*(t(jackknife_rg_subthreshold_mat) %*% jackknife_rg_subthreshold_mat)
+  
+  rg_random_var = t(gradient_rg_subthreshold) %*% S_rg_subthreshold %*% gradient_rg_subthreshold
+  rg_random_se = sqrt(rg_random_var)
+  
+  } else if (rg_random_se_estimator == "jackknife") {
+    rg_jackknife = rho_jackknife/sqrt(h2_trait1_jackknife * h2_trait2_jackknife)
+    rg_random_se = sqrt(((num_blocks-1)/num_blocks) * sum((rg_jackknife - mean(rg_jackknife))^2))
+    
+  }
+  
 
 
   if (length(sig_genes) > 0) {
@@ -170,10 +203,11 @@ BHR_rg <- function(trait1_sumstats, trait2_sumstats, annotations, num_blocks = 1
                           rho_jackknife = rho_jackknife,
                           rg_jackknife = rg_jackknife,
                           intercept = genetic_covariance_random$intercept,
-                          sig_genes = sig_genes,
+                          sig_genes = if (length(sig_genes) > 0) {pair_sumstats_sig$gene} else {NA},
                           #         fractions_mixed = fixed_results$fractions,
                           fractions_subthreshold = genetic_covariance_random$fractions,
-                          enrichments_subthreshold = genetic_covariance_random$enrichments_final))
+                          enrichments_subthreshold = genetic_covariance_random$enrichments_final),
+                run_time = Sys.time() - start_time)
   } else {
     output = list(trait1 = heritability_trait1,
                   trait2 = heritability_trait2,
@@ -186,10 +220,11 @@ BHR_rg <- function(trait1_sumstats, trait2_sumstats, annotations, num_blocks = 1
                             rho_mixed = rho_mixed,
                             rho_mixed_se = rho_mixed_se,
                             intercept = genetic_covariance_random$intercept,
-                            sig_genes = sig_genes,
+                            sig_genes = if (length(sig_genes) > 0) {pair_sumstats_sig$gene} else {NA},
                             #         fractions_mixed = fixed_results$fractions,
                             fractions_subthreshold = genetic_covariance_random$fractions,
-                            enrichments_subthreshold = genetic_covariance_random$enrichments_final))
+                            enrichments_subthreshold = genetic_covariance_random$enrichments_final),
+                  run_time = Sys.time() - start_time)
   }
 
 
