@@ -1,0 +1,221 @@
+---
+title: 'BHR Example: Burden Heritability in the BipEx dataset'
+output:
+  html_document: default
+  pdf_document: default
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+```
+## Description 
+
+This file contains the code to run a BHR analysis of bipolar disorder, from publicly available summary statistics to final estimates.
+
+Because this trait is binary, and we have only summary statistics, we compute per-allele effect sizes from case and control allele counts (Equation 33 in BHR paper). In the case of a continuous trait, one should compute per-allele effect sizes using a linear model.
+
+## Loading and filtering variants.
+
+The source file, "Bipex_variants_results.tsv", can be downloaded at this URL:
+https://bipex.broadinstitute.org/downloads
+
+The baseline model file, "baseline_model.txt", can be downloaded at this URL:
+https://github.com/ajaynadig/bhr/tree/master/reference_files
+
+```{r load}
+baseline_model <- read.table("ms_baseline_oe5.txt")
+
+asd_genes <- read_csv("./ASD_genes_FDR_05.csv", col_names = T)
+
+asd_genes %>% count(asd_genes)
+
+bp_variantlevel_bipex <- bigreadr::fread2("BipEx_variant_results.tsv.gz")
+
+variant_filter = bp_variantlevel_bipex$group == "Bipolar Disorder" & #Filter to Bipolar Disorder counts
+  bp_variantlevel_bipex$in_analysis == TRUE & #Use variant filter from Palmer et al, 2022
+  !is.na(bp_variantlevel_bipex$gene_id) & #Remove variants with NA gene ID 
+  str_detect(bp_variantlevel_bipex$locus, "^chr\\d") #Subset to autosomal variants
+
+  
+#Subset variants 
+bp_variantlevel_bipex <- bp_variantlevel_bipex[variant_filter,
+                                               c("gene_id",
+                                                 "consequence",
+                                                 "ac_case",
+                                                 "ac_ctrl",
+                                                 "locus",
+                                                 "mpc")]  
+
+```
+
+## Wrangling summary statistics into format for BHR
+
+```{r wrangle}
+wrangle_sumstats <- function(table,n_cases,n_controls, var_filter) {
+  
+  #Filter to variants of interest
+  table = table[var_filter,] 
+  
+  #Compute sample prevalence, will be used to compute per-sd beta
+  prevalence = n_cases/(n_cases+n_controls) 
+  
+  #Compute variant MAF in cases, will be used to compute per-sd beta
+  table$AF_case = table$ac_case/(2*n_cases) 
+  
+  #Compute variant MAFoverall, will be used to compute per-sd beta
+  table$AF = (table$ac_case + table$ac_ctrl)/(2*(n_cases + n_controls)) 
+  
+  #calculate per-sd betas
+  table$beta = (2 * (table$AF_case - table$AF) * prevalence)/sqrt(2 * table$AF * (1 - table$AF) * prevalence * (1 - prevalence))  
+  
+  #calculate variant variances
+  table$twopq = 2*table$AF * (1 - table$AF) 
+  
+  #convert betas from per-sd (i.e. sqrt(variance explained)) to per-allele (i.e. in units of phenotype) betas.
+  #per-allele are the usual betas reported by an exome wide association study.
+  table$beta_perallele = table$beta/sqrt(table$twopq)
+  
+  #aggregate into gene-level table.
+  #position doesn't need to be super precise, as it is only used to order genes for jackknife
+  #N = sum of case and control counts
+  sumstats = data.frame(gene = table$gene_id,
+                        AF = table$AF,
+                        beta = table$beta_perallele,
+                        gene_position = parse_number(sapply(strsplit(table$locus, split = ":"), function(x) x[[2]])),
+                        chromosome =  parse_number(sapply(strsplit(table$locus, split = ":"), function(x) x[[1]])),
+                        N = n_cases + n_controls,
+                        phenotype_key = "BP")
+  
+  #we have found that in these smaller sample analyses, there are some genes with
+  #large burden scores that are clearly outliers
+  #we remove one such gene, TTN
+  sumstats <- sumstats[sumstats$gene != "ENSG00000155657",]
+  
+  
+  return(sumstats)
+}
+
+bp_sumstats_ptv = wrangle_sumstats(bp_variantlevel_bipex,
+                                             14210, #N from Palmer et al, 2022
+                                             14422, #N from Palmer et al, 2022
+                                             bp_variantlevel_bipex$consequence == "ptv")
+
+bp_sumstats_missenseMPC2 = wrangle_sumstats(bp_variantlevel_bipex[!is.na(bp_variantlevel_bipex$mpc),],
+                                             14210,
+                                             14422,
+                                              bp_variantlevel_bipex$consequence[!is.na(bp_variantlevel_bipex$mpc)] %in% c("damaging_missense", "other_missense") &
+                                              bp_variantlevel_bipex$mpc[!is.na(bp_variantlevel_bipex$mpc)] > 2)
+
+bp_sumstats_synonymous = wrangle_sumstats(bp_variantlevel_bipex,
+                                             14210,
+                                             14422,
+                                             bp_variantlevel_bipex$consequence == "synonymous")
+
+
+
+```
+
+## Running BHR
+```{r run}
+#install BHR
+#devtools::install_github("ajaynadig/bhr", force = TRUE)
+library(bhr)
+bp_ptv_bhr <- BHR(trait1_sumstats = bp_sumstats_ptv, 
+                       annotations = list(baseline_model), #baseline model including constraint annotations
+                       num_blocks = 100, #number of blocks for jackknife
+                       mode = "univariate") #run in univariate mode to compute burden h2
+
+
+
+###############################################################################################
+#
+# investigate the enrichment of ASD genes in BP. Is that the correct way to calculate that??
+#
+###############################################################################################
+bp_ptv_bhr_asdgenes <- BHR(trait1_sumstats = bp_sumstats_ptv, 
+                       annotations = list(baseline_model, asd_genes), 
+                       num_blocks = 100, #number of blocks for jackknife
+                       mode = "univariate") #run in univariate mode to compute burden h2
+
+# Q1 why the heritabilities for the four baseline_oes differ when comparing the results from bp_ptv_bhr and bp_ptv_bhr_asdgenes? The introduction of ASD gene set appears to influence the heritabilities of baseline_oes. shouldn't we expect baseline_oes values remain consistent regarldess of this addition of asd_genes?     
+bp_ptv_bhr$mixed_model$heritabilities
+bp_ptv_bhr_asdgenes$mixed_model$heritabilities
+
+# Q2 what's the genomewide_h2? the difference between it and $heritabilities[1,"total"]?
+bp_ptv_bhr$mixed_model$genomewide_h2
+bp_ptv_bhr$mixed_model$heritabilities[1,"total"]
+
+# Q3 is the following result the enrichment of ASD gens in BP? 
+bp_ptv_bhr_asdgenes$mixed_model$enrichments_final$asd_genes
+
+# Q4 if I wanna check the heritability of one particular gene, would it make sense to run following code
+onegene <- baseline_model %>% 
+  select(gene) %>% 
+  mutate(onegene = ifelse(gene=="ENSG00000069018",1,0))
+
+bp_ptv_bhr_onegene <- BHR(trait1_sumstats = bp_sumstats_ptv, 
+                       annotations = list(baseline_model, onegene), 
+                       num_blocks = 100, #number of blocks for jackknife
+                       mode = "univariate") #run in univariate mode to compute burden h2
+
+
+# Q5 how to obtain the results of ST12 BHR analysis of Genebass significant genes
+
+
+###############################################################################################
+
+
+bp_missenseMPC2_bhr <- BHR(bp_sumstats_missenseMPC2, 
+                       annotations = list(baseline_model),
+                       num_blocks = 100,
+                       mode = "univariate")
+
+bp_synonymous_bhr <- BHR(bp_sumstats_synonymous, 
+                       annotations = list(baseline_model),
+                       num_blocks = 100,
+                       mode = "univariate")
+
+#convert observed scale to liability scale h2
+
+#calculate sample prevalence
+bp_sample_prevalence = 14210/(14210 + 14422) 
+
+#this population prevalence estimate is from Ferrari et al, 2016 Bipolar Disorders
+population_prevalence_bp = 0.007 
+
+
+obs2lia_factor <- function(K, P){
+  X <- qnorm(K,lower.tail=FALSE)
+  z <- (1/sqrt(2*pi))*(exp(-(X**2)/2))
+  factor <- (K*(1-K)*K*(1-K))/(P*(1-P)*(z**2))
+  return(factor)
+}
+
+bp_scalingfactor = obs2lia_factor(population_prevalence_bp,bp_sample_prevalence)
+
+print(paste0("BP PTV Burden Heritability: ",
+             round(bp_ptv_bhr$mixed_model$heritabilities[1,5] * bp_scalingfactor, 4),
+             " ",
+             "(",
+             round(bp_ptv_bhr$mixed_model$heritabilities[2,5] * bp_scalingfactor, 4),
+             ")"))
+
+print(paste0("BP Missense MPC > 2 Burden Heritability: ",
+             round(bp_missenseMPC2_bhr$mixed_model$heritabilities[1,5] * bp_scalingfactor, 4),
+             " ",
+             "(",
+             round(bp_missenseMPC2_bhr$mixed_model$heritabilities[2,5] * bp_scalingfactor, 4),
+             ")"))
+
+print(paste0("BP Synonymous Burden Heritability: ",
+             round(bp_synonymous_bhr$mixed_model$heritabilities[1,5] * bp_scalingfactor, 4),
+             " ",
+             "(",
+             round(bp_synonymous_bhr$mixed_model$heritabilities[2,5] * bp_scalingfactor, 4),
+             ")"))
+
+
+```
